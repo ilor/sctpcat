@@ -1,0 +1,7 @@
+#ifndef SCTPCAT_CONFIG
+#define SCTPCAT_CONFIG
+
+#define SctpCat_VERSION_MAJOR @SctpCat_VERSION_MAJOR@
+#define SctpCat_VERSION_MINOR @SctpCat_VERSION_MINOR@
+
+#endif //SCTPCAT_CONFIG
