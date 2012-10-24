@@ -263,14 +263,7 @@ void SctpCat::setup(std::string host, const std::string &port)
     {
         if (host.empty() && port.empty())
         {
-            if (m_options.count("ipv6"))
-            {
-                m_fd = setupSocket(AF_INET, NULL, 0);
-            }
-            else
-            {
-                m_fd = setupSocket(AF_INET6, NULL, 0);
-            }
+            m_fd = setupSocket(m_aiFamily, NULL, 0);
         }
         else
         {
@@ -382,39 +375,25 @@ int main(int argc, char** argv)
     }
 
     std::vector<std::string> hp = vm["host-port"].as< std::vector<std::string> >();
-    if (hp.size() == 1 && !vm.count("ipv6"))
-    {
-        std::string str = hp[0];
-        size_t colon = str.rfind(":");
-        if (colon != std::string::npos)
-        {
-            hp[0] = str.substr(0, colon);
-            hp.push_back(str.substr(colon + 1));
-        }
-    }
+    std::string host, port;
     if (hp.size() > 2)
     {
         std::cerr << "Too many host-port elements (" << vm.count("host-port") << ")\n";
         return 2;
     }
-
-    std::string host, port;
-    if (hp.size() == 1)
-    {
-        if (vm.count("listen"))
-        {
-            port = hp[0];
-        }
-        else
-        {
-            std::cerr << "Port argument required to connect to remote host\n";
-            return 2;
-        }
-    }
-    else
+    else if (hp.size() == 2)
     {
         host = hp[0];
         port = hp[1];
+    }
+    else if (vm.count("listen"))
+    {
+        port = hp[0];
+    }
+    else
+    {
+        std::cerr << "Port argument required to connect to remote host\n";
+        return 2;
     }
 
     if (vm.count("debug"))
