@@ -187,7 +187,6 @@ private:
 template<typename T>
 void SctpNotificationPrinter::process(const T& event)
 {
-    m_os << timestamp();
     m_os << stringize_sctp_sn_type(reinterpret_cast<const sctp_notification*>(&event)->sn_header.sn_type);
 }
 

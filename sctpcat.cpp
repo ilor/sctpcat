@@ -21,50 +21,29 @@
 #include <boost/optional.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/make_shared.hpp>
-#include <boost/program_options.hpp>
 
 #include <boost/thread.hpp>
 
 #include "addrinfo.hpp"
 #include "exception.hpp"
+#include "sctpcat.h"
 #include "util.hpp"
+#include "pingthread.h"
+#include "consolethread.h"
 
-typedef boost::program_options::variables_map varmap;
-
-class SctpCat
+void disableHb(int fd, sctp_assoc_t assoc_id, const sockaddr_storage& addr, size_t addr_len)
 {
-public:
-    SctpCat(const varmap& options);
-    void setup(std::string host, const std::string& port);
-    void listenSocket();
-    void connectSocket(const std::string &host, const std::string &port);
-    void receiveLoop();
-    void pingLoop(int bytes, int interval);
-    void consoleLoop();
-    void send(const char* buf, size_t len);
-    void setPathMaxRetrans(sctp_assoc_t assoc_id, int count);
-    void setAssocMaxRetrans(sctp_assoc_t assoc_id, int count);
-    void setRto(int rtoMin, int rtoMax, int rtoInitial);
-private:
-    void subscribeAllEvents(int fd);
-    int setupSocket(int ai_family, sockaddr* local_addr, socklen_t local_addr_len);
-
-    void receiveMessages(int fd);
-    void processMessage(int fd, char* buf, int len, sockaddr* from, socklen_t fromlen,
-                        const sctp_sndrcvinfo& sinfo, int flags);
-    int m_fd;
-    sctp_assoc_t m_assoc_id;
-    static const int s_maxPendingConnections = 10;
-    bool m_printTicks;
-    int m_aiFamily;
-    bool m_listen;
-    const varmap& m_options;
-    boost::shared_ptr<addrinfo> m_ai;
-    mutable boost::mutex m_mutex;
-    typedef boost::mutex::scoped_lock ScopedLock;
-    std::vector< boost::function<void(sctp_assoc_t)> > m_newAssocCallbacks;
-    std::vector< boost::function<void(sctp_assoc_t, sockaddr_storage&)> > m_newPaddrCallbacks;
-};
+    sctp_paddrparams params;
+    memset(&params, 0, sizeof(params));
+    params.spp_flags = SPP_HB_DISABLE;
+    params.spp_assoc_id = assoc_id;
+    memcpy(&params.spp_address, &addr, addr_len);
+    if (setsockopt(fd, SOL_SCTP, SCTP_PEER_ADDR_PARAMS, &params, socklen_t(sizeof(params))) != 0)
+    {
+        SCTPCAT_THROW(SctpCatError()) << clib_failure("setsockopt", errno);
+    }
+    std::cerr << timestamp() << "Disabled HB on " << sockaddr2string(&addr) << "\n";
+}
 
 SctpCat::SctpCat(const varmap& options)
     : m_fd(-1), m_options(options)
@@ -72,6 +51,21 @@ SctpCat::SctpCat(const varmap& options)
     m_printTicks = options.count("ticks");
     m_aiFamily = options.count("ipv6") ? AF_INET6 : AF_INET;
     m_listen = options.count("listen");
+
+    if (m_options.count("no-hb-on-secondary"))
+    {
+        registerPeerAddressCallback(boost::bind(disableHb, _1, _2, _3, sizeof(sockaddr_storage)));
+    }
+}
+
+void SctpCat::registerAssociationCallback(boost::function<void (int, sctp_assoc_t)> cb)
+{
+    m_associationCallbacks.push_back(cb);
+}
+
+void SctpCat::registerPeerAddressCallback(boost::function<void (int, sctp_assoc_t, const sockaddr_storage &)> cb)
+{
+    m_peerAddresssCallbacks.push_back(cb);
 }
 
 int SctpCat::setupSocket(int ai_family, sockaddr* local_addr, socklen_t local_addr_len)
@@ -132,20 +126,6 @@ void SctpCat::subscribeAllEvents(int fd)
     }
 }
 
-void disableHb(int fd, sctp_assoc_t assoc_id, void* addr, size_t addr_len)
-{
-    sctp_paddrparams params;
-    memset(&params, 0, sizeof(params));
-    params.spp_flags = SPP_HB_DISABLE;
-    params.spp_assoc_id = assoc_id;
-    memcpy(&params.spp_address, addr, addr_len);
-    if (setsockopt(fd, SOL_SCTP, SCTP_PEER_ADDR_PARAMS, &params, socklen_t(sizeof(params))) != 0)
-    {
-        SCTPCAT_THROW(SctpCatError()) << clib_failure("setsockopt", errno);
-    }
-    std::cerr << timestamp() << "Disabled HB on " << sockaddr2string(reinterpret_cast<sockaddr*>(addr)) << "\n";
-}
-
 void SctpCat::receiveLoop()
 {
     int epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -181,30 +161,14 @@ void SctpCat::receiveLoop()
     }
 }
 
-void SctpCat::pingLoop(int bytes, int interval)
-{
-    std::vector<char> buf(bytes);
-    for (int i = 0; i < bytes; ++i)
-    {
-        buf[i] = 'A' + (i % ('Z' - 'A'));
-    }
-    for (;;)
-    {
-        boost::this_thread::sleep(boost::posix_time::milliseconds(interval));
-        if (m_assoc_id == 0)
-        {
-            std::cerr << timestamp() << "No association, not pinging";
-        }
-        else
-        {
-            send(&buf[0], bytes);
-        }
-    }
-}
-
 void SctpCat::send(const char* buf, size_t len)
 {
     ScopedLock(m_mutex);
+    if (m_assoc_id == 0)
+    {
+        std::cerr << "send: no association; data discarded (" << len << ") bytes";
+        return;
+    }
     sctp_sndrcvinfo sinfo;
     memset(&sinfo, 0, sizeof(sinfo));
     sinfo.sinfo_assoc_id = m_assoc_id;
@@ -223,19 +187,6 @@ void SctpCat::send(const char* buf, size_t len)
     }
 }
 
-void SctpCat::consoleLoop()
-{
-    for (;;)
-    {
-        std::string input;
-        std::getline(std::cin, input);
-        if (!input.empty())
-        {
-            send(input.c_str(), input.size());
-        }
-    }
-}
-
 void SctpCat::receiveMessages(int fd)
 {
     const int msgbufsize = 2000;
@@ -244,6 +195,7 @@ void SctpCat::receiveMessages(int fd)
     socklen_t fromlen = sizeof(from);
     sockaddr* from_ptr = reinterpret_cast<sockaddr*>(&from);
     sctp_sndrcvinfo sinfo;
+    memset(&sinfo, 0, sizeof(sinfo));
     int flags = 0;
 
     for (;;)
@@ -277,18 +229,20 @@ void SctpCat::processMessage(int fd, char* buf, int len, sockaddr* from, socklen
             if (notify->sn_assoc_change.sac_state == SCTP_COMM_UP)
             {
                 m_assoc_id = notify->sn_assoc_change.sac_assoc_id;
-                ptrdiff_t info_from = offsetof(sctp_assoc_change, sac_info);
-                ptrdiff_t info_to = len;
                 std::cerr << timestamp() << "COMM_UP on assoc_id " << m_assoc_id << "\n";
+                for (size_t i = 0; i < m_associationCallbacks.size(); ++i)
+                {
+                    m_associationCallbacks[i](fd, m_assoc_id);
+                }
             }
         }
         if (notify->sn_header.sn_type == SCTP_PEER_ADDR_CHANGE)
         {
             if (notify->sn_paddr_change.spc_state == SCTP_ADDR_CONFIRMED)
             {
-                if (m_options.count("no-hb-on-secondary"))
+                for (size_t i = 0; i < m_peerAddresssCallbacks.size(); ++i)
                 {
-                    disableHb(fd, notify->sn_paddr_change.spc_assoc_id, &notify->sn_paddr_change.spc_aaddr, sizeof(notify->sn_paddr_change.spc_aaddr));
+                    m_peerAddresssCallbacks[i](fd, notify->sn_paddr_change.spc_assoc_id, notify->sn_paddr_change.spc_aaddr);
                 }
             }
         }
@@ -366,6 +320,7 @@ void SctpCat::setPathMaxRetrans(sctp_assoc_t assoc_id, int count)
     {
         SCTPCAT_THROW(SctpCatError()) << clib_failure("setsockopt", errno);
     }
+    std::cerr << "PathMaxRetransmissions set to " << count << " on association " << assoc_id << "\n";
 }
 
 void SctpCat::setAssocMaxRetrans(sctp_assoc_t assoc_id, int count)
@@ -378,6 +333,7 @@ void SctpCat::setAssocMaxRetrans(sctp_assoc_t assoc_id, int count)
     {
         SCTPCAT_THROW(SctpCatError()) << clib_failure("setsockopt", errno);
     }
+    std::cerr << "AssociationMaxRetransmissions set to " << count << " on association " << assoc_id << "\n";
 }
 
 int main(int argc, char** argv)
@@ -490,11 +446,13 @@ int main(int argc, char** argv)
             }
             sc.connectSocket(host, port);
         }
+        boost::shared_ptr<PingThread> ping;
         if (vm.count("ping-interval"))
         {
-            boost::thread ping_thread(boost::bind(&SctpCat::pingLoop, &sc, vm["ping-bytes"].as<int>(), vm["ping-interval"].as<int>()));
+            ping = boost::make_shared<PingThread>(boost::ref(sc), vm["ping-bytes"].as<int>(), vm["ping-interval"].as<int>());
+            sc.registerAssociationCallback(boost::bind(&PingThread::start, ping.get()));
         }
-        boost::thread ping_thread(boost::bind(&SctpCat::consoleLoop, &sc));
+        boost::thread console_thread(boost::bind(&consoleThread, boost::ref(sc)));
         sc.receiveLoop();
     }
     catch (boost::exception & e)

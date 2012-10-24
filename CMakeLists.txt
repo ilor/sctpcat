@@ -12,6 +12,8 @@ add_definitions("-DHAVE_SCTPCAT_CONFIG_H")
 
 set (SctpCat_SOURCES
     addrinfo.cpp
+    consolethread.cpp
+    pingthread.cpp
     sctpcat.cpp
     util.cpp
 )
